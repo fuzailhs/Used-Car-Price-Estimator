@@ -136,32 +136,113 @@ def similar_prices(df: pd.DataFrame, brand: str, year: int) -> pd.Series:
     return nearby["price_usd"]
 
 
-def top_factors(df: pd.DataFrame, brand: str, year: int, mileage: int, fuel: str):
-    """Up to 3 plain-language reasons behind the estimate."""
-    factors = []
+def top_factors(
+    df: pd.DataFrame,
+    brand: str,
+    model: str,
+    year: int,
+    mileage: int,
+    fuel: str,
+    transmission: str,
+    match_count: int,
+):
+    """Exactly 3 plain-English reasons behind the estimate, biggest first."""
     brand_cars = df[df["full_brand"] == brand]
     baseline = brand_cars if len(brand_cars) >= 10 else df
+    overall_mean = float(df["price_usd"].mean())
+    scored = []
 
     median_year = float(baseline["year"].median())
-    if year <= median_year - 3:
-        factors.append("Older year than similar cars lowers the price")
-    elif year >= median_year + 3:
-        factors.append("Newer year than similar cars raises the price")
+    year_gap = year - median_year
+    if abs(year_gap) >= 3:
+        direction = "added value" if year_gap > 0 else "pulled it down"
+        scored.append(
+            (
+                abs(year_gap) / 3.0,
+                f"{abs(int(year_gap))} years newer than similar cars {direction}"
+                if year_gap > 0
+                else f"{abs(int(year_gap))} years older than similar cars {direction}",
+            )
+        )
+    else:
+        scored.append((0.1, "Year is typical for similar cars, little effect"))
 
     median_mileage = float(baseline["mileage_miles"].median())
-    if mileage >= median_mileage + 20000:
-        factors.append("Higher mileage than similar cars lowers the price")
-    elif mileage <= median_mileage - 20000:
-        factors.append("Lower mileage than similar cars raises the price")
+    mileage_gap = mileage - median_mileage
+    if abs(mileage_gap) >= 20000:
+        direction = "pulled it down" if mileage_gap > 0 else "added value"
+        scored.append(
+            (
+                abs(mileage_gap) / 20000.0,
+                f"High mileage ({int(mileage):,} miles) {direction}"
+                if mileage_gap > 0
+                else f"Low mileage ({int(mileage):,} miles) {direction}",
+            )
+        )
+    else:
+        scored.append((0.1, "Mileage is close to average, little effect"))
 
     fuel_mean = float(df[df["fuel_type"] == fuel]["price_usd"].mean())
-    overall_mean = float(df["price_usd"].mean())
-    if fuel_mean > overall_mean * 1.05:
-        factors.append(f"{fuel} fuel type raises the price vs. average")
-    elif fuel_mean < overall_mean * 0.95:
-        factors.append(f"{fuel} fuel type lowers the price vs. average")
+    fuel_edge = (fuel_mean - overall_mean) / overall_mean
+    if abs(fuel_edge) >= 0.05:
+        direction = "added value" if fuel_edge > 0 else "pulled it down"
+        scored.append(
+            (abs(fuel_edge) * 10.0, f"{fuel} fuel type {direction} vs. average")
+        )
+    else:
+        scored.append((0.1, f"{fuel} fuel type is priced near average"))
 
-    return factors[:3]
+    brand_mean = float(baseline["price_usd"].mean())
+    brand_edge = (brand_mean - overall_mean) / overall_mean
+    if abs(brand_edge) >= 0.10:
+        direction = "added value" if brand_edge > 0 else "pulled it down"
+        scored.append(
+            (
+                abs(brand_edge) * 10.0,
+                f"{brand} badge {direction} vs. the whole market",
+            )
+        )
+
+    trans_mean = float(df[df["trans_simple"] == transmission]["price_usd"].mean())
+    trans_edge = (trans_mean - overall_mean) / overall_mean
+    if abs(trans_edge) >= 0.10:
+        direction = "added value" if trans_edge > 0 else "pulled it down"
+        scored.append(
+            (
+                abs(trans_edge) * 10.0,
+                f"{transmission} transmission {direction} vs. average",
+            )
+        )
+
+    if match_count < 5:
+        scored.append(
+            (
+                0.2,
+                "Rare model in our data, estimate leans on similar cars",
+            )
+        )
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [text for _, text in scored[:3]]
+
+
+def closest_listings(
+    df: pd.DataFrame, brand: str, model: str, prediction: float, n: int = 3
+) -> pd.DataFrame:
+    """The n real listings nearest to the estimate, same model first."""
+    same_model = df[
+        (df["full_brand"] == brand) & (df["model"] == model)
+    ].copy()
+    same_model["gap"] = (same_model["price_usd"] - prediction).abs()
+    picks = same_model.nsmallest(n, "gap")
+    if len(picks) < n:
+        rest = df[
+            (df["full_brand"] == brand)
+            & ~(df["model"] == model)
+        ].copy()
+        rest["gap"] = (rest["price_usd"] - prediction).abs()
+        picks = pd.concat([picks, rest.nsmallest(n - len(picks), "gap")])
+    return picks.head(n)
 
 
 pipeline, listings = get_trained()
@@ -255,10 +336,45 @@ if st.button("Estimate price"):
                 f"Average mileage: {int(float(same['mileage_miles'].mean())):,} miles"
             )
 
+            st.subheader("What moved this price")
             for factor in top_factors(
-                listings, brand, int(year), int(mileage), fuel_type
+                listings,
+                brand,
+                model,
+                int(year),
+                int(mileage),
+                fuel_type,
+                transmission,
+                match_count,
             ):
                 st.write(f"- {factor}")
+
+            st.subheader("Most similar real listings")
+            st.write("Closest matches in our data so you can sanity-check the estimate.")
+            similar = closest_listings(listings, brand, model, prediction, 3)
+            st.dataframe(
+                similar[
+                    [
+                        "full_brand",
+                        "model",
+                        "year",
+                        "mileage_miles",
+                        "fuel_type",
+                        "price_usd",
+                    ]
+                ].rename(
+                    columns={
+                        "full_brand": "Brand",
+                        "model": "Model",
+                        "year": "Year",
+                        "mileage_miles": "Mileage (miles)",
+                        "fuel_type": "Fuel",
+                        "price_usd": "Price (USD)",
+                    }
+                ),
+                hide_index=True,
+                use_container_width=True,
+            )
 
 st.divider()
 st.subheader("Explore the market")
